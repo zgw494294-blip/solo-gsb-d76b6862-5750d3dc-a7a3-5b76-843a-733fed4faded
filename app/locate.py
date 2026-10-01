@@ -103,30 +103,76 @@ def parse_program_time(raw: str) -> Decimal:
     return exact_add(whole_seconds, decimal_fraction(fraction or ""))
 
 
+def _digits_to_int(digits: tuple[int, ...]) -> int:
+    """Interpret a tuple of decimal digits as an integer, digit by digit.
+
+    Unlike ``int("".join(...))`` this never builds an over-long decimal
+    string, so it is unaffected by the global integer-string-conversion
+    limit regardless of how many sub-second digits the input carries.
+    """
+
+    value = 0
+    for digit in digits:
+        value = value * 10 + digit
+    return value
+
+
+def _complement_digits(digits: tuple[int, ...], length: int) -> tuple[int, ...]:
+    """Digit-level ten's complement padding ``digits`` out to ``length``.
+
+    Computes the digits of ``10**length - coefficient`` directly, without
+    ever formatting a ``10**4300+`` integer to a string. The coefficient is
+    assumed to be non-zero and smaller than ``10**length``.
+    """
+
+    padded = ((0,) * (length - len(digits))) + digits
+    result = [9 - digit for digit in padded]
+    carry = 1  # ten's complement = nine's complement plus one
+    for index in range(length - 1, -1, -1):
+        value = result[index] + carry
+        result[index] = value % 10
+        carry = value // 10
+    return tuple(result)
+
+
 def _floor_to_second(timestamp: Decimal) -> tuple[int, Decimal]:
     """Split ``timestamp`` into ``(floor_seconds, fraction)`` exactly.
 
-    Works on the decimal coefficient directly so no decimal-context precision
-    (default 28 significant digits) can round deep fractions of large epoch
-    bases before the split. The fraction always satisfies ``0 <= frac < 1``,
-    including for negative (pre-epoch) timestamps.
+    Works on the decimal coefficient digits directly so neither the
+    decimal-context precision (default 28 significant digits) nor the global
+    integer-string-conversion limit (default 4300 digits) can interfere:
+    a legal timestamp may carry an unbounded number of fraction digits
+    (e.g. ``2024-01-01T00:00:00.`` followed by 4999 zeros then a ``1``),
+    and the whole coefficient is never converted to one giant integer or
+    formatted as one giant digit string. The fraction always satisfies
+    ``0 <= frac < 1``, including for negative (pre-epoch) timestamps.
     """
 
     sign, digits, exponent = timestamp.as_tuple()
     if exponent >= 0:
-        return int(timestamp), Decimal(0)
+        return _digits_to_int(digits) * (-1 if sign else 1), Decimal(0)
 
-    coefficient = int("".join(str(d) for d in digits)) if digits else 0
-    scale = 10**-exponent
-    toward_zero, remainder = divmod(coefficient, scale)
+    fraction_length = -exponent
+    if len(digits) <= fraction_length:
+        whole = 0
+        frac_digits = digits
+    else:
+        cut = len(digits) - fraction_length
+        whole = _digits_to_int(digits[:cut])
+        frac_digits = digits[cut:]
+
+    remainder = any(frac_digits)
     if sign and remainder:
         # Negative non-integer: floor is one below truncation toward zero and
         # the fractional part is measured up from that lower whole second.
-        numerator = scale - remainder
-        fraction = decimal_fraction(f"{numerator:0{-exponent}d}")
-        return -toward_zero - 1, fraction
-    fraction = decimal_fraction(f"{remainder:0{-exponent}d}")
-    return -toward_zero if sign else toward_zero, fraction
+        whole_seconds = -whole - 1
+        fraction = Decimal((0, _complement_digits(frac_digits, fraction_length), -fraction_length))
+    else:
+        whole_seconds = -whole if sign else whole
+        fraction = (
+            Decimal((0, frac_digits, -fraction_length)) if remainder else Decimal(0)
+        )
+    return whole_seconds, fraction
 
 
 def format_program_time(timestamp: Decimal) -> str:

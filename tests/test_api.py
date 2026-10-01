@@ -8,8 +8,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.hls import PlaylistParseError, parse_playlist
+from app.exactdecimal import exact_sub
 from app.locate import (
     LocateError,
+    _floor_to_second,
     format_program_time,
     locate,
     parse_program_time,
@@ -1957,3 +1959,177 @@ def test_api_old_endpoints_still_available_after_switch_plan():
         json={"playlist_url": BASE_URL, "snapshots": [snap, snap]},
     )
     assert resp.status_code == 200
+
+
+# ---------------- regression: legal sub-second fractions beyond the global
+# integer-string-conversion limit (default 4300 digits) must stay exact on the
+# shared response-output chain (locate / intersect / switch-plan), including
+# pre-1970 timestamps.
+
+# 4999 zeros followed by a 1: the anchor carries 5000 fractional digits, so
+# any code path that turns the whole decimal coefficient into one integer
+# string trips Python's default 4300-digit integer conversion limit.
+OVERLONG_FRACTION = "0" * 4999 + "1"
+OVERLONG_ANCHOR = f"2024-01-01T00:00:00.{OVERLONG_FRACTION}Z"
+OVERLONG_ANCHOR_END = f"2024-01-01T00:00:10.{OVERLONG_FRACTION}Z"
+
+
+def _overlong_primary():
+    return (
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
+        f"#EXT-X-PROGRAM-DATE-TIME:{OVERLONG_ANCHOR}\n#EXTINF:10,\n"
+        "https://a.example.com/live/a0.ts\n"
+    )
+
+
+def _overlong_backup():
+    return (
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z\n#EXTINF:10,\n"
+        "https://b.example.com/live/b0.ts\n"
+    )
+
+
+def test_floor_to_second_keeps_overlong_fraction_without_int_limit():
+    timestamp = parse_program_time(OVERLONG_ANCHOR)
+    whole, fraction = _floor_to_second(timestamp)
+    assert whole == 1704067200
+    assert fraction == Decimal(f"0.{OVERLONG_FRACTION}")
+    # format() renders every digit; nothing is truncated or rounded away.
+    assert format_program_time(timestamp) == OVERLONG_ANCHOR
+
+
+def test_floor_to_second_pre_epoch_overlong_fraction_keeps_whole_second():
+    # A negative (pre-1970) timestamp with an overlong fraction must not be
+    # split at the wrong second nor lose the fraction: floor goes one second
+    # down and the fraction is measured up from that second.
+    raw = f"1969-12-31T23:59:59.{OVERLONG_FRACTION}Z"
+    timestamp = parse_program_time(raw)
+    whole, fraction = _floor_to_second(timestamp)
+    assert whole == -1
+    assert fraction == Decimal(f"0.{OVERLONG_FRACTION}")
+    assert format_program_time(timestamp) == raw
+    # The timestamp's floor is the second -1 (1969-12-31T23:59:59Z); the
+    # exact sub-second distance back to that whole second is the fraction.
+    from app.exactdecimal import exact_add, exact_sub
+
+    after_epoch = exact_add(timestamp, Decimal(1))
+    assert after_epoch == Decimal(f"0.{OVERLONG_FRACTION}")
+    assert format_program_time(after_epoch) == f"1970-01-01T00:00:00.{OVERLONG_FRACTION}Z"
+    back_to_floor = exact_sub(timestamp, Decimal(f"0.{OVERLONG_FRACTION}"))
+    assert back_to_floor == -1
+    assert format_program_time(back_to_floor) == "1969-12-31T23:59:59Z"
+
+
+def test_floor_to_second_negative_fraction_with_trailing_zeros_carries():
+    # -1.5 000...001 (deep trailing-zero fraction): the ten's-complement carry
+    # must propagate through the trailing zeros rather than yield an invalid
+    # digit; floor is -2 and the fraction is 0.4 999...999.
+    fraction_digits = "5" + "0" * 4998 + "1"
+    whole, frac = _floor_to_second(Decimal(f"-1.{fraction_digits}"))
+    assert whole == -2
+    assert frac == Decimal(f"0.{'4' + '9' * 4999}")
+    assert format_program_time(Decimal(f"-1.{fraction_digits}")) == (
+        f"1969-12-31T23:59:58.{'4' + '9' * 4999}Z"
+    )
+
+
+def test_format_program_time_pre_epoch_basic_still_exact():
+    assert format_program_time(Decimal("-0.5")) == "1969-12-31T23:59:59.5Z"
+    assert format_program_time(Decimal("-1.50")) == "1969-12-31T23:59:58.5Z"
+    assert format_program_time(Decimal("-2.000")) == "1969-12-31T23:59:58Z"
+
+
+def test_api_switch_plan_overlong_fraction_is_200_primary_only_and_exact():
+    # Reproduction: both primary snapshots agree (sequence/URI/10s/anchor);
+    # the anchor carries 500 fractional digits through "000...001". The backup
+    # legally covers the window too, but the primary does, so only "a" is used.
+    primary = _overlong_primary()
+    backup = _overlong_backup()
+    resp = switch_post(
+        URL_A, [primary, primary], URL_B, [backup, backup],
+        start=OVERLONG_ANCHOR, end="2024-01-01T00:00:01Z",
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["start_at"] == OVERLONG_ANCHOR
+    assert body["end_at"] == "2024-01-01T00:00:01Z"
+    assert len(body["intervals"]) == 1
+    interval = body["intervals"][0]
+    assert interval["source"] == "a"
+    assert interval["sequence"] == 0
+    assert interval["uri"] == "https://a.example.com/live/a0.ts"
+    assert interval["start_at"] == OVERLONG_ANCHOR
+    assert interval["end_at"] == "2024-01-01T00:00:01Z"
+    assert interval["offset_start"] == "0"
+    # 1 - 1e-5000, every digit retained.
+    assert interval["offset_end"] == "0." + "9" * 5000
+
+
+def test_api_locate_overlong_fraction_anchor_keeps_exact_utc_and_offset():
+    primary = _overlong_primary()
+    resp = locate_post(
+        [primary, primary], "2024-01-01T00:00:00.5Z",
+        url=URL_A,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["sequence"] == 0
+    assert body["start_at"] == OVERLONG_ANCHOR
+    assert body["end_at"] == OVERLONG_ANCHOR_END
+    # 0.5 - 1e-5000: one 4 followed by 4999 nines (5000 fractional digits).
+    expected_offset = exact_sub(Decimal("0.5"), Decimal(f"0.{OVERLONG_FRACTION}"))
+    assert Decimal(body["offset"]) == expected_offset
+    assert body["offset"] == "0.4" + "9" * 4999
+    assert len(body["offset"]) == 5002
+
+
+def test_api_intersect_overlong_fraction_keeps_exact_utc_times():
+    primary = _overlong_primary()
+    backup = (
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
+        f"#EXT-X-PROGRAM-DATE-TIME:{OVERLONG_ANCHOR}\n#EXTINF:10,\n"
+        "https://b.example.com/live/b0.ts\n"
+    )
+    resp = intersect_post(URL_A, [primary, primary], URL_B, [backup, backup])
+    assert resp.status_code == 200, resp.text
+    intervals = resp.json()["intervals"]
+    assert len(intervals) == 1
+    assert intervals[0]["start_at"] == OVERLONG_ANCHOR
+    assert intervals[0]["end_at"] == OVERLONG_ANCHOR_END
+    assert intervals[0]["offset_a"] == "0"
+    assert intervals[0]["offset_b"] == "0"
+
+
+def test_api_switch_plan_overlong_fraction_pre_epoch_across_1970():
+    # Window straddles the epoch; the overlong pre-1970 anchor must split to
+    # the right whole second on both sides of 1970-01-01T00:00:00Z.
+    anchor = f"1969-12-31T23:59:59.{OVERLONG_FRACTION}Z"
+    primary = (
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
+        f"#EXT-X-PROGRAM-DATE-TIME:{anchor}\n#EXTINF:10,\n"
+        "https://a.example.com/live/a0.ts\n"
+    )
+    backup = (
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
+        "#EXT-X-PROGRAM-DATE-TIME:1969-12-31T23:59:59Z\n#EXTINF:10,\n"
+        "https://b.example.com/live/b0.ts\n"
+    )
+    resp = switch_post(
+        URL_A, [primary, primary], URL_B, [backup, backup],
+        start="1969-12-31T23:59:59.5Z",
+        end="1970-01-01T00:00:00.5Z",
+    )
+    assert resp.status_code == 200, resp.text
+    intervals = resp.json()["intervals"]
+    assert len(intervals) == 1
+    interval = intervals[0]
+    assert interval["source"] == "a"
+    assert interval["start_at"] == "1969-12-31T23:59:59.5Z"
+    assert interval["end_at"] == "1970-01-01T00:00:00.5Z"
+    assert Decimal(interval["offset_start"]) == exact_sub(
+        Decimal("0.5"), Decimal(f"0.{OVERLONG_FRACTION}")
+    )
+    assert Decimal(interval["offset_end"]) == exact_sub(
+        Decimal("1.5"), Decimal(f"0.{OVERLONG_FRACTION}")
+    )

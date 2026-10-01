@@ -504,6 +504,63 @@ curl -s http://localhost:8000/v1/switch-plan \
 }
 ```
 
+### 合法超长小数秒在输出链路中逐位保留（回归示例）
+
+合法的小数秒**位数不设上限**。下面锚点的小数部分是 `0` 重复 4999 次后接一个 `1`
+（共 5000 位小数，超过 Python 默认的 4300 位整数串转换上限）：主路两份快照序号、
+URI、`EXTINF:10` 与锚点完全一致，备路以整秒锚点合法覆盖；请求 `[start_at, end_at)`
+取锚点到 `2024-01-01T00:00:01Z`，主路全程有覆盖，因此只选主路。UTC 时刻与片内
+偏移必须逐位精确，不得返回 500：
+
+```bash
+python3 - <<'PY'
+import json, urllib.request
+
+frac = "0" * 4999 + "1"          # 5000 位合法小数秒
+anchor = f"2024-01-01T00:00:00.{frac}Z"
+a_pl = (
+    "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
+    f"#EXT-X-PROGRAM-DATE-TIME:{anchor}\n#EXTINF:10,\n"
+    "https://a.example.com/live/a0.ts\n"
+)
+b_pl = (
+    "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
+    "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z\n#EXTINF:10,\n"
+    "https://b.example.com/live/b0.ts\n"
+)
+payload = {
+    "a": {"playlist_url": "https://a.example.com/live/index.m3u8",
+          "snapshots": [a_pl, a_pl]},
+    "b": {"playlist_url": "https://b.example.com/live/index.m3u8",
+          "snapshots": [b_pl, b_pl]},
+    "start_at": anchor,
+    "end_at": "2024-01-01T00:00:01Z",
+}
+req = urllib.request.Request(
+    "http://localhost:8000/v1/switch-plan",
+    data=json.dumps(payload).encode(),
+    headers={"Content-Type": "application/json"},
+)
+with urllib.request.urlopen(req) as resp:
+    body = json.load(resp)
+
+assert resp.status == 200
+assert len(body["intervals"]) == 1
+interval = body["intervals"][0]
+assert interval["source"] == "a"                    # 主路全程覆盖，只选主路
+assert interval["start_at"] == anchor              # UTC 起点逐位保留
+assert interval["end_at"] == "2024-01-01T00:00:01Z"
+assert interval["offset_start"] == "0"
+assert interval["offset_end"] == "0." + "9" * 5000  # 1 - 1e-5000，逐位精确
+print("ok:", interval["source"], len(interval["offset_end"]) - 2, "fractional digits")
+PY
+```
+
+同一条输出链路对 `POST /v1/locate`、`/v1/intersect` 同样有效：把同样的 5000 位锚点
+作为 PDT 提交，返回的 `start_at` / `end_at` 与片内偏移都逐位保留。1970 年之前的
+时刻（如 `1969-12-31T23:59:59.000…001Z`）也按同一规则在整秒与小数之间拆分，
+不会错拆到相邻秒，也不会丢失小数。
+
 ## `POST /v1/vod`：导出指定时段的 VOD 媒体清单
 
 请求体在 `playlist_url` 与 `snapshots` 之外，接收十进制秒区间
