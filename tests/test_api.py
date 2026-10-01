@@ -1957,3 +1957,144 @@ def test_api_old_endpoints_still_available_after_switch_plan():
         json={"playlist_url": BASE_URL, "snapshots": [snap, snap]},
     )
     assert resp.status_code == 200
+
+
+# ----------------- over-long legal fractions vs the int str-digit limit
+
+# A legal fraction beyond Python's default 4300-digit integer string
+# conversion limit (5000 digits: 4999 zeros then a one). Output formatting
+# used to materialize such a coefficient through int(str) while rendering the
+# response, raising ValueError -> HTTP 500. No digit may be truncated.
+DEEP_FRAC = "0" * 4999 + "1"
+DEEP_ANCHOR = f"2024-01-01T00:00:00.{DEEP_FRAC}Z"
+DEEP_A = (
+    "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
+    f"#EXT-X-PROGRAM-DATE-TIME:{DEEP_ANCHOR}\n#EXTINF:10,\n"
+    "https://a.example.com/live/a0.ts\n"
+)
+DEEP_B = (
+    "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
+    "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z\n#EXTINF:10,\n"
+    "https://b.example.com/live/b0.ts\n"
+)
+
+
+def test_format_program_time_round_trips_overlong_legal_fraction():
+    from app.locate import _floor_to_second
+
+    timestamp = parse_program_time(DEEP_ANCHOR)
+    whole, fraction = _floor_to_second(timestamp)
+    assert whole == 1704067200
+    assert format(fraction, "f") == f"0.{DEEP_FRAC}"
+    assert format_program_time(timestamp) == DEEP_ANCHOR
+    # The segment end keeps every fraction digit after adding a whole duration.
+    from app.exactdecimal import exact_add
+
+    assert format_program_time(exact_add(timestamp, Decimal(10))) == (
+        f"2024-01-01T00:00:10.{DEEP_FRAC}Z"
+    )
+
+
+def test_pre_epoch_overlong_fraction_splits_second_exactly():
+    from app.exactdecimal import exact_add, exact_sub
+    from app.locate import _floor_to_second
+
+    deep = Decimal((0, tuple(int(ch) for ch in DEEP_FRAC), -5000))
+
+    # Constructed instant -1.000..001 = -(1 + 0.000..001): floor is -2 with
+    # fraction 0.999..999, so the whole second is neither mis-split nor the
+    # deep fraction lost.
+    instant = exact_sub(Decimal(-1), deep)
+    whole, fraction = _floor_to_second(instant)
+    assert whole == -2
+    assert format(fraction, "f") == f"0.{'9' * 5000}"
+
+    # A pre-epoch wall time 23:59:58.000..001Z is POSIX -2 + 0.000..001 =
+    # -1.999..999: floor -2 with fraction 0.000..001, and it formats back to
+    # exactly the wall time that was given (no second drift, no lost digits).
+    raw = f"1969-12-31T23:59:58.{DEEP_FRAC}Z"
+    timestamp = parse_program_time(raw)
+    whole, fraction = _floor_to_second(timestamp)
+    assert whole == -2
+    assert format(fraction, "f") == f"0.{DEEP_FRAC}"
+    assert format_program_time(timestamp) == raw
+    assert exact_add(Decimal(whole), fraction) == timestamp
+
+
+def test_pre_epoch_whole_and_short_fraction_times_stay_pre_epoch():
+    assert (
+        format_program_time(parse_program_time("1900-01-01T00:00:00Z"))
+        == "1900-01-01T00:00:00Z"
+    )
+    # -0.25 formats against the floored second (-1) with fraction 0.75:
+    # the date stays 1969-12-31 and the time is 23:59:59.75, never a wrongly
+    # split or fraction-dropped instant.
+    assert (
+        format_program_time(parse_program_time("1969-12-31T23:59:59.75Z"))
+        == "1969-12-31T23:59:59.75Z"
+    )
+    assert (
+        format_program_time(parse_program_time("1969-12-31T23:59:59Z"))
+        == "1969-12-31T23:59:59Z"
+    )
+
+
+def test_api_switch_plan_overlong_fraction_is_200_primary_only_and_exact():
+    resp = switch_post(
+        URL_A, [DEEP_A, DEEP_A], URL_B, [DEEP_B, DEEP_B],
+        start=DEEP_ANCHOR, end="2024-01-01T00:00:01Z",
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["start_at"] == DEEP_ANCHOR
+    assert body["end_at"] == "2024-01-01T00:00:01Z"
+    assert [item["source"] for item in body["intervals"]] == ["a"]
+    interval = body["intervals"][0]
+    assert interval["sequence"] == 0
+    assert interval["uri"] == "https://a.example.com/live/a0.ts"
+    assert interval["start_at"] == DEEP_ANCHOR
+    assert interval["end_at"] == "2024-01-01T00:00:01Z"
+    assert interval["offset_start"] == "0"
+    # 1 - 0.000..001 == 0.999..999, digit for digit.
+    assert interval["offset_end"] == f"0.{'9' * 5000}"
+
+
+def test_api_locate_overlong_fraction_keeps_exact_utc_and_offset():
+    resp = locate_post([DEEP_A, DEEP_A], DEEP_ANCHOR, url=URL_A)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["sequence"] == 0
+    assert body["uri"] == "https://a.example.com/live/a0.ts"
+    assert body["start_at"] == DEEP_ANCHOR
+    assert body["end_at"] == f"2024-01-01T00:00:10.{DEEP_FRAC}Z"
+    assert body["offset"] == "0"
+
+
+def test_api_intersect_overlong_fraction_keeps_exact_utc_and_offsets():
+    resp = intersect_post(URL_A, [DEEP_A, DEEP_A], URL_B, [DEEP_B, DEEP_B])
+    assert resp.status_code == 200, resp.text
+    intervals = resp.json()["intervals"]
+    assert len(intervals) == 1
+    interval = intervals[0]
+    assert interval["start_at"] == DEEP_ANCHOR
+    assert interval["end_at"] == "2024-01-01T00:00:10Z"
+    assert interval["offset_a"] == "0"
+    assert interval["offset_b"] == f"0.{DEEP_FRAC}"
+
+
+def test_api_locate_pre_epoch_deep_fraction_is_exact():
+    raw = f"1969-12-31T23:59:58.{DEEP_FRAC}Z"
+    snap = (
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
+        f"#EXT-X-PROGRAM-DATE-TIME:{raw}\n#EXTINF:10,\n"
+        f"{SEG_URL}\n"
+    )
+    resp = locate_post([snap, snap], raw)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    # POSIX -1.999..999 formats back to the anchor wall time, digit for digit.
+    assert body["start_at"] == raw
+    # start + 10s = 8.000..001: it crosses the minute while keeping every
+    # deep fractional digit.
+    assert body["end_at"] == f"1970-01-01T00:00:08.{DEEP_FRAC}Z"
+    assert body["offset"] == "0"

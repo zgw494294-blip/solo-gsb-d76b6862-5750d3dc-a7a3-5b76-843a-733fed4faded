@@ -504,6 +504,52 @@ curl -s http://localhost:8000/v1/switch-plan \
 }
 ```
 
+### 合法超长小数秒必须原样输出（回归示例）
+
+小数位数没有上限，**即使超过 Python 默认的 4300 位整数串转换上限**（例如
+5000 位小数：4999 个 `0` 后接一个 `1`）也必须逐位保留——输出链路直接在
+`Decimal` 系数字节上做秒拆分，绝不经过 `int(str)`，既不截断、不用浮点，也
+不提高/关闭全局整数转换上限。下面的主路两份快照序号、URI、`EXTINF:10` 与锚点
+完全一致；备路从整点合法覆盖。请求起点等于锚点、终点为
+`2024-01-01T00:00:01Z`。期望 `200` 且**只选主路**：`start_at` 原样保留 5000
+位小数，`offset_start` 为 `0`，`offset_end` 为精确的 `0.` 后接 5000 个 `9`
+（即 `1 - 0.000…001`）。
+
+小数串太长不便手写，用下面的命令生成请求体并调用（`/v1/locate`、
+`/v1/intersect` 走同一条输出链路，行为相同）：
+
+```bash
+python - <<'PY' | curl -s http://localhost:8000/v1/switch-plan \
+  -H 'Content-Type: application/json' --data-binary @-
+import json
+
+frac = "0" * 4999 + "1"
+anchor = f"2024-01-01T00:00:00.{frac}Z"
+primary = (
+    "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
+    f"#EXT-X-PROGRAM-DATE-TIME:{anchor}\n#EXTINF:10,\n"
+    "https://a.example.com/live/a0.ts\n"
+)
+backup = (
+    "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
+    "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z\n#EXTINF:10,\n"
+    "https://b.example.com/live/b0.ts\n"
+)
+print(json.dumps({
+    "a": {"playlist_url": "https://a.example.com/live/index.m3u8",
+          "snapshots": [primary, primary]},
+    "b": {"playlist_url": "https://b.example.com/live/index.m3u8",
+          "snapshots": [backup, backup]},
+    "start_at": anchor,
+    "end_at": "2024-01-01T00:00:01Z",
+}))
+PY
+```
+
+同一条链路也保证 **1970 年之前**（POSIX 秒为负）的时刻不会拆错秒或丢失小数：
+例如 `1969-12-31T23:59:58.000…001Z`（内部为 `-1.999…999`）拆成整秒 `-2` 与
+小数 `0.000…001`，格式化后仍是原时刻，不会被进位/舍入成别的秒。
+
 ## `POST /v1/vod`：导出指定时段的 VOD 媒体清单
 
 请求体在 `playlist_url` 与 `snapshots` 之外，接收十进制秒区间

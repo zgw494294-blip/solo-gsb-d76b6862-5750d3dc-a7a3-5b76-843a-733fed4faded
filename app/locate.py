@@ -103,30 +103,72 @@ def parse_program_time(raw: str) -> Decimal:
     return exact_add(whole_seconds, decimal_fraction(fraction or ""))
 
 
+def _digits_to_int(digits: tuple[int, ...]) -> int:
+    """Combine a tuple of decimal digits into an int without an int<->str step.
+
+    The coefficient of a legal sub-second value may carry thousands of digits
+    (the default ``sys.set_int_max_str_digits`` limit is 4300). Building the
+    coefficient through a decimal string (``int("".join(...))``) would raise
+    ``ValueError`` while merely *outputting* a legal timestamp. Horner
+    accumulation only performs int arithmetic, which stays unlimited.
+    """
+
+    value = 0
+    for digit in digits:
+        value = value * 10 + digit
+    return value
+
+
+def _fraction_from_digits(digits: tuple[int, ...]) -> Decimal:
+    """Build the exact value ``0.digits`` straight from coefficient digits.
+
+    Construction from a coefficient tuple neither parses a long decimal string
+    nor rounds under the active context, so it works for arbitrarily deep
+    fractions.
+    """
+
+    if not digits:
+        return Decimal(0)
+    return Decimal((0, digits, -len(digits)))
+
+
 def _floor_to_second(timestamp: Decimal) -> tuple[int, Decimal]:
     """Split ``timestamp`` into ``(floor_seconds, fraction)`` exactly.
 
-    Works on the decimal coefficient directly so no decimal-context precision
-    (default 28 significant digits) can round deep fractions of large epoch
-    bases before the split. The fraction always satisfies ``0 <= frac < 1``,
-    including for negative (pre-epoch) timestamps.
+    Works on the decimal coefficient directly (no decimal-context precision
+    can round deep fractions of large epoch bases before the split, and no
+    integer string conversion can trip the global ``int`` digit limit). The
+    fraction always satisfies ``0 <= frac < 1``, including for negative
+    (pre-epoch) timestamps.
     """
 
     sign, digits, exponent = timestamp.as_tuple()
     if exponent >= 0:
-        return int(timestamp), Decimal(0)
+        whole = _digits_to_int(digits) * (10**exponent)
+        return -whole if sign else whole, Decimal(0)
 
-    coefficient = int("".join(str(d) for d in digits)) if digits else 0
-    scale = 10**-exponent
-    toward_zero, remainder = divmod(coefficient, scale)
-    if sign and remainder:
-        # Negative non-integer: floor is one below truncation toward zero and
-        # the fractional part is measured up from that lower whole second.
-        numerator = scale - remainder
-        fraction = decimal_fraction(f"{numerator:0{-exponent}d}")
-        return -toward_zero - 1, fraction
-    fraction = decimal_fraction(f"{remainder:0{-exponent}d}")
-    return -toward_zero if sign else toward_zero, fraction
+    scale = -exponent
+    whole_digits, remainder_digits = digits[:-scale], digits[-scale:]
+    toward_zero = _digits_to_int(whole_digits)
+
+    if sign and any(remainder_digits):
+        # Negative non-integer -q.frac: floor is -(q + 1) and the positive
+        # fractional part measured up from that second is 1 - 0.frac, i.e.
+        # the nine's complement plus one ulp. Computed digit by digit so no
+        # coefficient ever crosses the global integer string-conversion limit.
+        fraction_digits = [9 - digit for digit in remainder_digits]
+        for index in range(scale - 1, -1, -1):
+            if fraction_digits[index] < 9:
+                fraction_digits[index] += 1
+                break
+            # Trailing 9s carry over to 0; a non-zero remainder guarantees a
+            # non-9 digit exists somewhere above, so the carry stays in range.
+            fraction_digits[index] = 0
+        return -toward_zero - 1, _fraction_from_digits(tuple(fraction_digits))
+
+    return -toward_zero if sign else toward_zero, _fraction_from_digits(
+        remainder_digits
+    )
 
 
 def format_program_time(timestamp: Decimal) -> str:
